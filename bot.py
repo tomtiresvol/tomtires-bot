@@ -1,50 +1,64 @@
 import os
 import anthropic
+import httpx
+from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-SYSTEM_PROMPT = """Ти — ШІ-консультант інтернет-магазину шин "ПП Терлецький" / TomTires (Україна).
+async def search_tomtires(query: str) -> str:
+    try:
+        url = f"https://tomtires.com.ua/catalog/tyre/?search={query.replace(' ', '+')}"
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        items = soup.select(".catalog-item, .product-item, .tire-item")[:5]
+        if not items:
+            cards = soup.select("a[href*='/catalog/tyre/']")[:8]
+            results = []
+            for card in cards:
+                name = card.get_text(strip=True)
+                href = card.get("href", "")
+                if len(name) > 10 and "/catalog/tyre/v-" in href:
+                    results.append(f"• {name}\n  https://tomtires.com.ua{href}")
+            if results:
+                return "Знайдено на tomtires.com.ua:\n\n" + "\n\n".join(results[:5])
+        result_text = []
+        for item in items:
+            name = item.get_text(strip=True)[:100]
+            result_text.append(f"• {name}")
+        return "Знайдено на tomtires.com.ua:\n" + "\n".join(result_text)
+    except Exception as e:
+        return f"Не вдалось знайти на сайті: {e}"
+
+SYSTEM_PROMPT = """Ти — ШІ-консультант інтернет-магазину шин ПП Терлецький / TomTires (Україна, Володимир-Волинський).
+
+ПРІОРИТЕТ: завжди спочатку пропонуй шини від постачальника ПП Терлецький (Володимир-Волинський).
 
 Ти допомагаєш клієнтам:
-1. Підібрати шини для автомобіля або мотоцикла за їхніми параметрами
-2. Відповісти на питання про бренди:
-   - Мотошини: Michelin, Pirelli, Dunlop, Metzeler, Shinko, Anlas
-   - Автошини: BFGoodrich KO2, KO3, KM3, Trail-Terrain
-3. Оформити заявку або замовлення (збери: ПІБ, телефон, бажана шина, розмір)
-4. Розповісти про умови: доставка по Україні, розстрочка до 12 місяців
+1. Підібрати шини для автомобіля або мотоцикла
+2. Відповісти на питання про бренди: Michelin, Pirelli, Dunlop, Metzeler, BFGoodrich KO2/KO3/KM3
+3. Оформити замовлення (збери: ПІБ, телефон, шина, розмір)
 
-При підборі шин обов'язково запитуй:
-- Тип транспорту (авто / мото)
-- Марку і модель
-- Розмір шини (якщо знає)
-- Сезон (літо/зима/всесезон)
-- Бюджет
+Коли клієнт називає розмір шини (наприклад 205 55 16) — я вже знайшов результати з сайту і передаю тобі їх. Використовуй ці дані щоб відповісти клієнту.
 
-Відповідай коротко, по справі, дружньо. Мова — українська.
-Якщо питання не стосується шин — ввічливо поверни до теми магазину.
-Не вигадуй ціни — скажи що уточниш або дай посилання tomtires.com.ua"""
+Умови магазину: доставка по Україні, розстрочка до 12 місяців.
+Відповідай коротко, дружньо, українською мовою."""
 
-# Зберігаємо історію чату для кожного користувача
 user_histories = {}
-
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_histories[user_id] = []
+    user_histories[update.effective_user.id] = []
     await update.message.reply_text(
-        "👋 Привіт! Я ШІ-консультант магазину шин TomTires.\n\n"
-        "Допоможу:\n"
-        "🔹 Підібрати шини для авто або мото\n"
+        "👋 Привіт! Я ШІ-консультант TomTires.\n\n"
+        "🔹 Підберу шини для авто або мото\n"
         "🔹 Відповім на питання про бренди\n"
         "🔹 Оформлю замовлення\n\n"
-        "З чого починаємо?"
+        "Напишіть розмір шини (наприклад: 205 55 16) або задайте питання!"
     )
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -53,13 +67,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_histories:
         user_histories[user_id] = []
 
-    user_histories[user_id].append({"role": "user", "content": user_text})
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    # Обмежуємо історію до 20 повідомлень щоб не перевищити ліміт токенів
+    site_data = ""
+    digits = [c for c in user_text if c.isdigit()]
+    if len(digits) >= 3:
+        await update.message.reply_text("🔍 Шукаю на сайті...")
+        site_data = await search_tomtires(user_text)
+
+    message_content = user_text
+    if site_data:
+        message_content = f"{user_text}\n\n[Дані з сайту tomtires.com.ua]:\n{site_data}"
+
+    user_histories[user_id].append({"role": "user", "content": message_content})
+
     if len(user_histories[user_id]) > 20:
         user_histories[user_id] = user_histories[user_id][-20:]
-
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
         response = client.messages.create(
@@ -68,18 +91,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system=SYSTEM_PROMPT,
             messages=user_histories[user_id],
         )
-
         reply = response.content[0].text
         user_histories[user_id].append({"role": "assistant", "content": reply})
-
         await update.message.reply_text(reply)
-
     except Exception as e:
         await update.message.reply_text(
-            "Вибачте, виникла технічна помилка. Спробуйте ще раз або зателефонуйте: (098) 500 12 50"
+            "Вибачте, технічна помилка. Телефонуйте: (098) 500 12 50"
         )
         print(f"Error: {e}")
-
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -87,7 +106,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущено...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
